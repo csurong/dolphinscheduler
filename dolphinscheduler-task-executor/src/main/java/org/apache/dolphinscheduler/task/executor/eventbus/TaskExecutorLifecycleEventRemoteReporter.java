@@ -29,6 +29,7 @@ import org.apache.dolphinscheduler.task.executor.log.TaskExecutorMDCUtils;
 
 import java.time.Duration;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -194,12 +195,15 @@ public class TaskExecutorLifecycleEventRemoteReporter extends BaseDaemonThread
     private boolean expireFinishedTaskEventChannel(final ReportableTaskExecutorLifecycleEventChannel eventChannel) {
         eventChannelsLock.lock();
         try {
-            if (eventChannel.finishedTime == null
-                    || System.currentTimeMillis() - eventChannel.finishedTime < taskEventReportMaxDurationMillis) {
+            final Optional<IReportableTaskExecutorLifecycleEvent> terminalEvent = eventChannel.getTerminalEvent();
+            if (!terminalEvent.isPresent()
+                    || System.currentTimeMillis()
+                            - terminalEvent.get().getEventCreateTime() < taskEventReportMaxDurationMillis) {
                 return false;
             }
+            // Keep preceding events until the terminal event expires: master state transitions depend on their order.
             if (eventChannels.remove(eventChannel.getTaskExecutorId(), eventChannel)) {
-                log.error("Task executor {} result was not acknowledged within {} ms after completion. "
+                log.error("Task executor {} result was not acknowledged within {} ms after terminal event creation. "
                         + "Discarding pending events for master {}",
                         eventChannel.getTaskExecutorId(), taskEventReportMaxDurationMillis,
                         eventChannel.workflowInstanceHost);
@@ -296,9 +300,11 @@ public class TaskExecutorLifecycleEventRemoteReporter extends BaseDaemonThread
             long waitInterval =
                     (getOldestReportTime() + DEFAULT_TASK_EXECUTOR_EVENT_RETRY_INTERVAL) - System.currentTimeMillis();
             for (final ReportableTaskExecutorLifecycleEventChannel eventChannel : eventChannels.values()) {
-                if (eventChannel.finishedTime != null) {
+                final Optional<IReportableTaskExecutorLifecycleEvent> terminalEvent = eventChannel.getTerminalEvent();
+                if (terminalEvent.isPresent()) {
                     waitInterval = Math.min(waitInterval,
-                            eventChannel.finishedTime + taskEventReportMaxDurationMillis - System.currentTimeMillis());
+                            terminalEvent.get().getEventCreateTime() + taskEventReportMaxDurationMillis
+                                    - System.currentTimeMillis());
                 }
             }
             if (waitInterval <= 0) {
@@ -319,8 +325,6 @@ public class TaskExecutorLifecycleEventRemoteReporter extends BaseDaemonThread
 
         private volatile String workflowInstanceHost;
 
-        private volatile Long finishedTime;
-
         public ReportableTaskExecutorLifecycleEventChannel(int taskExecutorId, String workflowInstanceHost) {
             this.taskExecutorId = taskExecutorId;
             this.workflowInstanceHost = workflowInstanceHost;
@@ -329,9 +333,12 @@ public class TaskExecutorLifecycleEventRemoteReporter extends BaseDaemonThread
 
         public void addTaskExecutionEvent(final IReportableTaskExecutorLifecycleEvent reportableTaskExecutorLifecycleEvent) {
             taskExecutionEventsQueue.add(reportableTaskExecutorLifecycleEvent);
-            if (reportableTaskExecutorLifecycleEvent.getType().isFinished() && finishedTime == null) {
-                finishedTime = System.currentTimeMillis();
-            }
+        }
+
+        private Optional<IReportableTaskExecutorLifecycleEvent> getTerminalEvent() {
+            return taskExecutionEventsQueue.stream()
+                    .filter(event -> event.getType().isFinished())
+                    .findFirst();
         }
 
         public IReportableTaskExecutorLifecycleEvent peek() {

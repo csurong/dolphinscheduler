@@ -61,6 +61,7 @@ public abstract class AbstractTaskExecutorWorker implements ITaskExecutorWorker 
     protected void onTaskExecutorSuccess(final ITaskExecutor taskExecutor) {
         taskExecutor.getTaskExecutionContext().setEndTime(System.currentTimeMillis());
         final TaskExecutorSuccessLifecycleEvent event = TaskExecutorSuccessLifecycleEvent.of(taskExecutor);
+        // Stop tracking before publishing the terminal event, whose listener may immediately finalize the executor.
         onTaskExecutorFinished(taskExecutor);
         taskExecutor.getTaskExecutorEventBus().publish(event);
     }

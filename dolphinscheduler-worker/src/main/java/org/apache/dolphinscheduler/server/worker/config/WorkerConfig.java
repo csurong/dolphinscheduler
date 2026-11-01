@@ -44,9 +44,9 @@ public class WorkerConfig implements Validator {
     private Duration maxHeartbeatInterval = Duration.ofSeconds(10);
 
     /**
-     * Maximum time to retain unacknowledged events after a task executor finishes.
+     * Maximum time to retain unacknowledged events after the terminal event is created.
      */
-    private Duration taskEventReportMaxDuration = Duration.ofHours(1);
+    private Duration taskEventReportMaxDuration = Duration.ofHours(6);
     private int hostWeight = 100;
     private WorkerServerLoadProtectionConfig serverLoadProtection = new WorkerServerLoadProtectionConfig();
     private String group;

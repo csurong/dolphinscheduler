@@ -25,6 +25,7 @@ import static org.mockito.Mockito.doAnswer;
 
 import org.apache.dolphinscheduler.common.enums.WorkflowExecutionStatus;
 import org.apache.dolphinscheduler.extract.master.command.RunWorkflowCommandParam;
+import org.apache.dolphinscheduler.plugin.task.api.enums.TaskExecutionStatus;
 import org.apache.dolphinscheduler.server.master.AbstractMasterIntegrationTestCase;
 import org.apache.dolphinscheduler.server.master.engine.IWorkflowRepository;
 import org.apache.dolphinscheduler.server.master.engine.executor.LogicTaskExecutorContainerProvider;
@@ -36,6 +37,7 @@ import org.apache.dolphinscheduler.server.master.integration.WorkflowTestCaseCon
 import org.apache.dolphinscheduler.server.master.rpc.LogicTaskExecutorOperatorImpl;
 import org.apache.dolphinscheduler.task.executor.eventbus.ITaskExecutorLifecycleEventReporter.TaskExecutorLifecycleEventAck;
 import org.apache.dolphinscheduler.task.executor.events.IReportableTaskExecutorLifecycleEvent;
+import org.apache.dolphinscheduler.task.executor.events.TaskExecutorDispatchedLifecycleEvent;
 import org.apache.dolphinscheduler.task.executor.events.TaskExecutorLifecycleEventType;
 
 import java.time.Duration;
@@ -125,6 +127,49 @@ class TaskExecutorFinalizationTestCase extends AbstractMasterIntegrationTestCase
         await().atMost(Duration.ofSeconds(10))
                 .untilAsserted(() -> assertThat(repository.queryWorkflowInstance(workflowId).getState())
                         .isEqualTo(WorkflowExecutionStatus.SUCCESS));
+        masterContainer.assertAllResourceReleased();
+    }
+
+    @Test
+    void shouldPreserveOldDispatchedEventUntilNewResultIsDelivered() {
+        final AtomicBoolean loseFirstDispatchedEvent = new AtomicBoolean(true);
+        final AtomicInteger pendingTaskId = new AtomicInteger();
+        doAnswer(invocation -> {
+            final IReportableTaskExecutorLifecycleEvent event = invocation.getArgument(1);
+            if (event.getType() == TaskExecutorLifecycleEventType.DISPATCHED
+                    && loseFirstDispatchedEvent.getAndSet(false)) {
+                // The prerequisite is older than the report deadline, but the terminal result will be fresh.
+                ((TaskExecutorDispatchedLifecycleEvent) event)
+                        .setEventCreateTime(System.currentTimeMillis() - Duration.ofHours(7).toMillis());
+                event.setLatestReportTime(System.currentTimeMillis());
+                pendingTaskId.set(event.getTaskInstanceId());
+                return null;
+            }
+            return invocation.callRealMethod();
+        }).when(reportClient).reportTaskExecutionEventToMaster(anyString(),
+                any(IReportableTaskExecutorLifecycleEvent.class));
+
+        final int workflowId = triggerWorkflow();
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            assertThat(pendingTaskId.get()).isPositive();
+            assertExecutorsReleased();
+            assertThat(repository.queryTaskInstance(workflowId)).hasSize(1)
+                    .allMatch(task -> task.getState() == TaskExecutionStatus.SUBMITTED_SUCCESS);
+            assertThat(reporter.getEventChannels()).containsKey(pendingTaskId.get());
+            assertThat(reporter.getEventChannels().get(pendingTaskId.get()).peek().getType())
+                    .isEqualTo(TaskExecutorLifecycleEventType.DISPATCHED);
+        });
+        assertThat(reporter.onWorkflowInstanceHostChanged(pendingTaskId.get(), masterConfig.getMasterAddress()))
+                .isTrue();
+
+        // Keeping DISPATCHED lets the master accept the following SUCCESS instead of ACKing an ignored result.
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            assertThat(repository.queryTaskInstance(workflowId)).hasSize(1)
+                    .allMatch(task -> task.getState() == TaskExecutionStatus.SUCCESS);
+            assertThat(repository.queryWorkflowInstance(workflowId).getState())
+                    .isEqualTo(WorkflowExecutionStatus.SUCCESS);
+        });
         masterContainer.assertAllResourceReleased();
     }
 
